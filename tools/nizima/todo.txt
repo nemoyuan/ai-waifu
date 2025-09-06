@@ -1,0 +1,6 @@
+uv run tools/nizima/fetch_nizima.py 111381
+
+
+
+133970
+133518
