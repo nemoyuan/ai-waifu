@@ -8,11 +8,13 @@ import asyncio
 import json
 import os
 import shutil
+import signal
 import tempfile
 import time
 import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,31 +26,96 @@ import aiohttp
 # Export功能需要用户登录认证，目前仅支持preview下载
 ENABLE_EXPORT_ATTEMPT = False
 
+# 脚本版本控制
+SCRIPT_VERSION = "v4"
+
+# 全局中断标志
+_shutdown_requested = False
+
+
+def signal_handler(signum, frame):
+    """信号处理器：优雅处理中断"""
+    global _shutdown_requested
+    _shutdown_requested = True
+    print("\n🛑 收到中断信号，正在安全停止...")
+    print("⏳ 等待当前操作完成，请稍候...")
+
+
+def is_shutdown_requested() -> bool:
+    """检查是否请求关闭"""
+    return _shutdown_requested
+
 
 # ==================== 工具函数 ====================
 
 
-def record_no_preview(item_id: str, output_dir: str):
-    """记录没有preview模型的作品ID到no_preview.txt"""
+def check_version(item_id: str, output_dir: str) -> bool:
+    """检查作品版本是否为最新"""
+
+    def _check_version_file(version_file: Path, dir_name: str = None) -> bool:
+        """检查单个版本文件"""
+        try:
+            with open(version_file, "r", encoding="utf-8") as f:
+                version_data = json.load(f)
+            current_version = version_data.get("version")
+
+            if current_version == SCRIPT_VERSION:
+                print(f"✅ 作品 {item_id} 已是最新版本 ({SCRIPT_VERSION})，跳过下载")
+                if dir_name:
+                    print(f"📁 找到目录: {dir_name}")
+                return True
+            else:
+                print(
+                    f"🔄 作品 {item_id} 版本不匹配 (本地: {current_version}, 当前: {SCRIPT_VERSION})，需要更新"
+                )
+                if dir_name:
+                    print(f"📁 找到目录: {dir_name}")
+                return False
+        except Exception:
+            return False
+
     try:
-        no_preview_file = Path(output_dir) / "no_preview.txt"
+        output_path = Path(output_dir)
 
-        # 检查是否已经记录过
-        existing_ids = set()
-        if no_preview_file.exists():
-            with open(no_preview_file, "r", encoding="utf-8") as f:
-                existing_ids = {line.strip() for line in f if line.strip()}
+        # 首先查找原始格式的目录 {item_id}/
+        version_file = output_path / item_id / "version.json"
+        if version_file.exists():
+            return _check_version_file(version_file)
 
-        # 如果没有记录过，则添加
-        if item_id not in existing_ids:
-            with open(no_preview_file, "a", encoding="utf-8") as f:
-                f.write(f"{item_id}\n")
-            print(f"📝 已记录无preview模型作品: {item_id} -> {no_preview_file}")
-        else:
-            print(f"📝 作品 {item_id} 已在无preview列表中")
+        # 如果原始格式不存在，查找重命名格式的目录 {item_id}_*/
+        for dir_path in output_path.iterdir():
+            if dir_path.is_dir() and dir_path.name.startswith(f"{item_id}_"):
+                version_file = dir_path / "version.json"
+                if version_file.exists():
+                    return _check_version_file(version_file, dir_path.name)
+
+        # 都没找到
+        return False
 
     except Exception as e:
-        print(f"⚠️ 记录无preview作品失败: {e}")
+        print(f"⚠️ 检查版本失败: {e}")
+        return False
+
+
+def save_version(item_id: str, output_dir: str):
+    """保存版本信息到version.json"""
+    try:
+        version_file = Path(output_dir) / item_id / "version.json"
+        version_file.parent.mkdir(parents=True, exist_ok=True)
+
+        version_data = {
+            "version": SCRIPT_VERSION,
+            "updated_at": datetime.now().isoformat(),
+            "item_id": item_id,
+        }
+
+        with open(version_file, "w", encoding="utf-8") as f:
+            json.dump(version_data, f, ensure_ascii=False, indent=2)
+
+        print(f"💾 版本信息已保存: {version_file} ({SCRIPT_VERSION})")
+
+    except Exception as e:
+        print(f"⚠️ 保存版本信息失败: {e}")
 
 
 # ==================== 数据结构 ====================
@@ -77,6 +144,7 @@ class ProcessingResult:
     task: DownloadTask
     final_path: Optional[Path] = None
     error: Optional[str] = None
+    model_name: Optional[str] = None  # 新增：模型名称
 
 
 @dataclass
@@ -126,6 +194,11 @@ class SafeFileManager:
         self.target_dir = target_dir
         self.backup_dir = target_dir.with_name(f"{target_dir.name}_back")
         self.temp_dir = Path("models/nizima/.temp") / target_dir.name
+        self.rename_callback = None  # 重命名回调函数
+
+    def set_rename_callback(self, callback):
+        """设置重命名回调函数"""
+        self.rename_callback = callback
 
     @asynccontextmanager
     async def safe_operation(self):
@@ -153,8 +226,20 @@ class SafeFileManager:
             # 4. 成功时移动到最终位置
             if self.temp_dir.exists():
                 self.target_dir.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(self.temp_dir), str(self.target_dir))
+
+                # 移动temp_dir的内容到target_dir，而不是移动temp_dir本身
+                if self.target_dir.exists():
+                    shutil.rmtree(self.target_dir)
+
+                # 重命名temp_dir为target_dir
+                self.temp_dir.rename(self.target_dir)
                 print(f"✅ 已移动到最终位置: {self.temp_dir} -> {self.target_dir}")
+
+                # 如果有重命名回调，执行重命名
+                if self.rename_callback:
+                    new_target_dir = self.rename_callback()
+                    if new_target_dir != self.target_dir:
+                        self.target_dir = new_target_dir
 
             # 5. 删除备份
             if self.backup_dir.exists():
@@ -233,6 +318,10 @@ class DownloadManager:
 
     async def _download_file(self, task: DownloadTask) -> ProcessingResult:
         """下载单个文件，支持重试"""
+        # 检查是否请求关闭
+        if is_shutdown_requested():
+            return ProcessingResult(success=False, task=task, error="用户请求中断下载")
+
         # 确保目标目录存在
         task.temp_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -386,11 +475,11 @@ class FileProcessor:
 
             success = await cls._extract_zip(zip_path, temp_extract_dir)
             if success:
-                # 重命名目录并移动到目标位置
-                final_dir = await cls._rename_by_moc3(
+                # 移动目录到目标位置，获取模型名称
+                model_name = await cls._move_to_final_dir(
                     temp_extract_dir, type_dir, file_type
                 )
-                return final_dir is not None
+                return model_name
 
             return False
 
@@ -470,27 +559,28 @@ class FileProcessor:
             return False
 
     @classmethod
-    async def _rename_by_moc3(
+    async def _move_to_final_dir(
         cls, extract_dir: Path, target_dir: Path, file_type: str
-    ) -> Optional[Path]:
-        """根据.moc3文件重命名目录"""
+    ) -> Optional[str]:
+        """将解压的文件移动到最终目录，返回模型名称"""
         try:
-            # 查找.moc3文件
+            # 查找.moc3文件确认这是Live2D模型
             moc3_files = list(extract_dir.rglob("*.moc3"))
-            if not moc3_files:
-                print("⚠️ 未找到.moc3文件，使用默认名称")
-                model_name = "model"
-            else:
+            if moc3_files:
                 moc3_file = moc3_files[0]
                 model_name = moc3_file.stem
                 print(f"🎭 找到Live2D模型: {model_name}")
+            else:
+                print("⚠️ 未找到.moc3文件")
+                model_name = "unknown_model"
 
-            final_dir = target_dir / model_name
+            # 直接使用file_type作为最终目录名（如preview、export）
+            final_dir = target_dir
 
             # 确保目标目录的父目录存在
             final_dir.parent.mkdir(parents=True, exist_ok=True)
 
-            # 移动目录
+            # 移动目录内容
             if final_dir.exists():
                 shutil.rmtree(final_dir)
 
@@ -498,7 +588,7 @@ class FileProcessor:
             if any(extract_dir.glob("*.moc3")):
                 extract_dir.rename(final_dir)
             else:
-                # 如果有子目录，移动第一个子目录
+                # 如果有子目录，移动第一个子目录的内容
                 subdirs = [d for d in extract_dir.iterdir() if d.is_dir()]
                 if subdirs:
                     subdirs[0].rename(final_dir)
@@ -509,10 +599,10 @@ class FileProcessor:
                     extract_dir.rename(final_dir)
 
             print(f"📁 {file_type}模型目录: {final_dir}")
-            return final_dir
+            return model_name
 
         except Exception as e:
-            print(f"❌ 重命名目录失败: {e}")
+            print(f"❌ 移动目录失败: {e}")
             return None
 
     @classmethod
@@ -674,32 +764,75 @@ class NizimaFetcher:
         self.item_id = str(item_id)
         self.output_dir = Path(output_dir)
         self.target_dir = self.output_dir / self.item_id
+        self.model_name = None  # 存储模型名称
+
+    def _rename_target_dir_with_model_name(self, model_name: str) -> Path:
+        """根据模型名称重命名目标目录"""
+        if not model_name or model_name == "unknown_model":
+            return self.target_dir
+
+        # 创建新的目录名：{id}_{model_name}
+        new_dir_name = f"{self.item_id}_{model_name}"
+        new_target_dir = self.output_dir / new_dir_name
+
+        # 如果当前目录存在且新目录名不同，则重命名
+        if self.target_dir.exists() and self.target_dir != new_target_dir:
+            try:
+                # 如果新目录已存在，先删除
+                if new_target_dir.exists():
+                    shutil.rmtree(new_target_dir)
+
+                # 重命名目录
+                self.target_dir.rename(new_target_dir)
+                print(
+                    f"📁 目录已重命名: {self.target_dir.name} -> {new_target_dir.name}"
+                )
+
+                # 更新target_dir
+                self.target_dir = new_target_dir
+
+            except Exception as e:
+                print(f"⚠️ 重命名目录失败: {e}")
+
+        return self.target_dir
 
     async def fetch(self) -> bool:
         """下载作品"""
         print("🚀 开始下载 Nizima 作品: {}".format(self.item_id))
         print("=" * 60)
 
-        try:
-            async with SafeFileManager(self.target_dir).safe_operation() as ctx:
-                # 1. 获取资源信息
-                print("📋 获取资源信息...")
-                assets_manager = AssetsManager(self.item_id)
-                assets_info, detail_data = await assets_manager.get_assets_info()
+        # 检查版本，如果已是最新版本则跳过
+        if check_version(self.item_id, self.output_dir):
+            return True
 
+        # 先获取资源信息，检查是否有preview模型
+        print("📋 获取资源信息...")
+        assets_manager = AssetsManager(self.item_id)
+        assets_info, detail_data = await assets_manager.get_assets_info()
+
+        # 如果没有preview模型，直接跳过，不保存任何信息
+        if not assets_info.preview_live2d_zip:
+            print("⚠️ 该作品没有Preview模型，直接跳过")
+            return False
+
+        try:
+            # 创建SafeFileManager并设置重命名回调
+            safe_manager = SafeFileManager(self.target_dir)
+            safe_manager.set_rename_callback(
+                lambda: (
+                    self._rename_target_dir_with_model_name(self.model_name)
+                    if self.model_name
+                    else self.target_dir
+                )
+            )
+
+            async with safe_manager.safe_operation() as ctx:
                 # 保存detail.json到临时目录
                 detail_path = ctx.temp_dir / "detail.json"
                 detail_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(detail_path, "w", encoding="utf-8") as f:
                     json.dump(detail_data, f, ensure_ascii=False, indent=2)
                 print(f"💾 detail.json已保存到临时目录: {detail_path}")
-
-                # 检查是否有preview模型
-                if not assets_info.preview_live2d_zip:
-                    print("⚠️ 该作品没有Preview模型，跳过下载")
-                    record_no_preview(self.item_id, self.output_dir)
-                    print(f"✅ 作品 {self.item_id} 处理完成（仅保存detail.json）")
-                    return True
 
                 # 2. 创建下载任务
                 print("📝 创建下载任务...")
@@ -726,6 +859,23 @@ class NizimaFetcher:
 
                 if success:
                     print("✅ 所有操作完成")
+
+                    # 如果有模型名称，更新版本信息中的模型名称
+                    model_name_for_version = (
+                        self.model_name if self.model_name else "unknown"
+                    )
+
+                    # 保存版本信息到临时目录
+                    version_file = ctx.temp_dir / "version.json"
+                    version_data = {
+                        "version": SCRIPT_VERSION,
+                        "updated_at": datetime.now().isoformat(),
+                        "item_id": self.item_id,
+                        "model_name": model_name_for_version,
+                    }
+                    with open(version_file, "w", encoding="utf-8") as f:
+                        json.dump(version_data, f, ensure_ascii=False, indent=2)
+                    print(f"💾 版本信息已保存: {version_file} ({SCRIPT_VERSION})")
                     return True
                 else:
                     print("❌ 处理过程中出现错误")
@@ -749,10 +899,11 @@ class NizimaFetcher:
 
             try:
                 if result.task.task_type == TaskType.PREVIEW_FILE:
-                    success = await FileProcessor.process_main_file(
+                    model_name = await FileProcessor.process_main_file(
                         result.final_path, temp_dir, "preview"
                     )
-                    if success:
+                    if model_name:
+                        result.model_name = model_name
                         print("✅ Preview文件处理完成")
                         success_count += 1
 
@@ -786,6 +937,18 @@ class NizimaFetcher:
                 print(f"❌ 处理文件失败 {result.final_path}: {e}")
 
         print(f"📊 处理结果: {success_count}/{total_count} 成功")
+
+        # 提取模型名称并重命名目录
+        model_name = None
+        for result in results:
+            if result.success and result.model_name:
+                model_name = result.model_name
+                break
+
+        if model_name:
+            self.model_name = model_name
+            print(f"🎭 提取到模型名称: {model_name}")
+
         return success_count > 0
 
 
@@ -807,6 +970,11 @@ async def fetch_multiple_items(
     async def download_single(item_id: str) -> bool:
         """下载单个作品"""
         async with semaphore:
+            # 检查是否请求关闭
+            if is_shutdown_requested():
+                print(f"🛑 跳过作品 {item_id}（用户请求中断）")
+                return False
+
             print(f"\n🎯 开始处理作品: {item_id}")
             try:
                 fetcher = NizimaFetcher(item_id, output_dir)
@@ -817,6 +985,9 @@ async def fetch_multiple_items(
                 else:
                     print(f"❌ 作品 {item_id} 下载失败")
                     return False
+            except KeyboardInterrupt:
+                print(f"🛑 作品 {item_id} 被用户中断")
+                return False
             except Exception as e:
                 print(f"❌ 作品 {item_id} 下载异常: {e}")
                 return False
@@ -859,6 +1030,10 @@ async def main():
     """主函数"""
     import argparse
 
+    # 注册信号处理器
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     parser = argparse.ArgumentParser(description="Nizima Live2D模型下载器 v3.0")
     parser.add_argument("item_ids", nargs="+", help="作品ID列表")
     parser.add_argument("--output", "-o", default="models/nizima", help="输出目录")
@@ -866,18 +1041,33 @@ async def main():
 
     args = parser.parse_args()
 
-    if len(args.item_ids) == 1:
-        # 单个作品下载
-        fetcher = NizimaFetcher(args.item_ids[0], args.output)
-        success = await fetcher.fetch()
+    try:
+        if len(args.item_ids) == 1:
+            # 单个作品下载
+            fetcher = NizimaFetcher(args.item_ids[0], args.output)
+            success = await fetcher.fetch()
 
-        if success:
-            print(f"\n🎉 下载完成! 文件保存在: {Path(args.output) / args.item_ids[0]}")
+            if is_shutdown_requested():
+                print("\n🛑 下载被用户中断")
+            elif success:
+                print(
+                    f"\n🎉 下载完成! 文件保存在: {Path(args.output) / args.item_ids[0]}"
+                )
+            else:
+                print("\n❌ 下载失败")
         else:
-            print("\n❌ 下载失败")
-    else:
-        # 批量下载
-        await fetch_multiple_items(args.item_ids, args.output, args.concurrent)
+            # 批量下载
+            await fetch_multiple_items(
+                list(set(args.item_ids)), args.output, args.concurrent
+            )
+
+            if is_shutdown_requested():
+                print("\n🛑 批量下载被用户中断")
+                print("💡 提示：已完成的下载会被保留，未完成的可以重新运行")
+
+    except KeyboardInterrupt:
+        print("\n🛑 下载被用户中断")
+        print("💡 提示：系统已安全清理，可以重新运行")
 
 
 if __name__ == "__main__":
